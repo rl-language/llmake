@@ -1,0 +1,7 @@
+_global:
+    "A shared context for all prompts."
+    command: "echo 'Hello from _global' > {name}.txt"
+    validator: "grep -q 'Hello' {name}.txt || (echo 'Validation failed' >&2; exit 1)" retry 1
+
+landscape: _global
+    "Describe a natural landscape. Inherits commands/validator from _global."

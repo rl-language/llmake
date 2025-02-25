@@ -1,133 +1,158 @@
-# LLMake - Feature Additions
 
-## 📌 Overview
-This document outlines the newly added features to **LLMake**, a system that facilitates structured LLM invocations through dependency-based prompts. The following key features were added:
+# **LLMake**
 
-1. **Support for Validator Commands**
-2. **Custom Commands for LLM Invocations**
-3. **Improved Parsing Errors for Better Debugging**
+A system for managing **structured prompt generation** and **execution** for Large Language Models (LLMs) via **dependency-based** automation. This repository includes:
 
-Each feature is explained in detail below.
-
----
-
-## 🛠️ 1. Support for Validator Commands
-### **What It Does**
-- Allows users to define **validation commands** to check the LLM-generated output.
-- If validation fails, the system can **retry execution** automatically.
-
-### **Implementation**
-- **New `validator` field** in the prompt definition.
-- Validators execute **shell commands** after the LLM command.
-- If validation **fails**, an **exit code `1`** is returned, triggering a **retry** (if enabled).
-
-### **Example Usage**
-```yaml
-village: _global, landscape
-    text: "Describe a small village inside the previously described landscape."
-    command: "ollama run mistral < {name}.prompt | tee {name}.txt"
-    validator: "grep -q 'village' {name}.txt || (echo 'Validation failed: No village mentioned.' >&2; exit 1)"
-    auto_retry: "3"
-```
-
-### **How It Works**
-- After running the **LLM command**, the validator **checks if the word 'village'** exists in the output.
-- If validation **fails**, it prints an error message and **triggers a retry** up to 3 times.
+1. **`llmake.py`**: The core implementation for parsing `.llmake` files, generating a Makefile, and orchestrating prompt dependencies, command inheritance, validators, and auto-retry.  
+2. **`test_llmakes/`**: A series of **example test prompts** illustrating successful cases, parse errors, multiple parent issues, and more.  
+3. **`check/`**: A reference (“golden”) set of expected outputs for success scenarios and stderr logs for failure scenarios.  
+4. **`test_llmake_system.py`**: An automated test suite that runs each `.llmake` file, compares outputs/stderr to references, and preserves results in a unique subdirectory.
 
 ---
 
-## ⚙️ 2. Custom Commands for LLM Invocations
-### **What It Does**
-- Allows users to specify **custom LLM commands** for each prompt.
-- Supports **multiple commands per prompt**, executing them sequentially.
+## **1. Features & Syntax**
 
-### **Implementation**
-- **New `command` field**, supporting **one or more commands**.
-- Commands are executed in **order**.
+### **1.1. Inheritance of Commands**
+- If a prompt (e.g., `child`) has **no** `command` lines, it **inherits** them from exactly one parent.  
+- If it has **two** parents that define commands, it raises an **error** (ambiguous inheritance).  
 
-### **Example Usage**
-```yaml
-village: _global, landscape
-    text: "Describe a small village inside the previously described landscape."
-    command: "ollama run mistral < {name}.prompt | tee {name}.txt"
-    command: "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.alt.txt"
-    validator: "grep -q 'village' {name}.txt || (echo 'Validation failed: No village mentioned.' >&2; exit 1)"
-    auto_retry: "2"
-```
-
-### **How It Works**
-- The **first command** runs `mistral` and saves output to `village.txt`.
-- The **second command** runs `deepseek-r1:14b` and saves output to `village.alt.txt`.
-- If validation fails, the system retries execution **up to 2 times**.
-
----
-
-## 🔍 3. Improved Parsing Errors
-### **What It Does**
-- Makes error messages **more readable and descriptive**.
-- Provides **exact token location (line/column)**.
-- Shows **expected vs. actual token** to help users debug faster.
-
-### **Implementation**
-- **Custom `ParseError` exception** with a **token dictionary** for better messages.
-
-#### **Before (Generic Error Message)**
 ```plaintext
-ParseError: Expected colons
+_global:
+    "Hidden context with commands"
+    command: "echo 'Hello from global' > {name}.txt"
+    validator: "grep -q 'Hello' {name}.txt || (echo 'Validation failed' >&2; exit 1)" retry 1
+
+landscape: _global
+    "Describe a natural landscape. Inherits commands/validator from _global."
 ```
 
-#### **After (Improved Error Message)**
-```plaintext
-ParseError (line 3, column 12): Expected ':' – got token "command" (type: NAME)
-```
+### **1.2. Validators with Inline Retry**
+- **`validator: "..." retry N`** syntax.  
+- Example:
+  ```plaintext
+  validator: "grep -q 'Hello' {name}.txt || (echo 'Validation failed' >&2; exit 1)" retry 2
+  ```
+- The system sets `auto_retry = 2` if not otherwise specified, so it will re-run the LLM commands/validators up to 2 times if validation fails.
 
-### **Code Changes**
-#### **Added Token Name Mapping for Human-Readable Errors**
-```python
-TOKEN_NAMES = {
-    "colons": "':'",
-    "comma": "','",
-    "period": "'.'",
-    "indent": "INDENT (⏩ expected indentation)",
-    "deindent": "DEDENT (⏪ expected dedentation)",
-    "newline": "NEWLINE (expected end of line)",
-    "string": 'a "string" (e.g., "text here")',
-    "name": "a NAME (e.g., variable or keyword)"
-}
-```
+### **1.3. Parse Errors with Better Messaging**
+- **Line & column** numbers.  
+- The **offending line** with a **caret (^)** marking the error position.  
+- E.g.:
+  ```
+  ParseError (line 3, column 12): Expected ':' – got token "..." (type: STRING)
+    command "something"
+           ^
+  ```
 
-#### **Updated `expect` Method to Use Human-Readable Symbols**
-```python
-def expect(self, element):
-    to_return = element()
-    if not to_return:
-        expected_name = element.__name__
-        expected_symbol = TOKEN_NAMES.get(expected_name, expected_name)
-        raise ParseError(
-            f"Expected {expected_symbol} – got token {self.current.string!r} (type: {tokenize.tok_name[self.current.type]})",
-            token=self.current
-        )
-    self.next()
-    return to_return
-```
+### **1.4. Command Inheritance from `_global` or Single Parent**
+- Hidden entries (like `_global:`) do not produce `.txt` files themselves, but **children** that depend on `_global` can inherit commands/validators.  
+- If a prompt has its own `command` lines, those override inherited ones.
 
-### **How It Works**
-- Instead of showing `Expected colons`, it now displays `Expected ':'`.
-- If the user makes a mistake, it shows **exact location + expected token**.
+### **1.5. Auto-Retry Logic**
+- If **auto_retry** is set (or derived from `validator ... retry N`), the generated Makefile wraps commands in an `until` shell loop.  
+- E.g.:
+  ```makefile
+  @retry=0; max_retry=2; \
+  until ( command && validator ... ); do
+    ...
+  done
+  ```
 
 ---
 
-## 🎯 Summary of Features
-| Feature | Description | Example |
-|---------|-------------|----------|
-| **Validator Commands** | Validates LLM output before proceeding | `validator: "grep -q 'village' {name}.txt || exit 1"` |
-| **Custom Commands** | Allows multiple LLM execution commands per prompt | `command: "ollama run mistral < {name}.prompt"` |
-| **Improved Errors** | Displays human-readable parse errors | `ParseError: Expected ':' – got token 'command'` |
+## **2. Example Directory Structure**
+
+```
+.
+├── llmake.py
+├── test_llmake_system.py
+├── test_llmakes/
+│   ├── test1_simple.llmake
+│   ├── test2_inheritance.llmake
+│   ├── test3_multi_parents.llmake
+│   ├── test4_validator.llmake
+│   ├── test5_parse_error_missing_colon.llmake
+│   └── test6_parse_error_trailing_comma.llmake
+├── check/
+│   ├── test1_simple/
+│   │   ├── alone.txt
+│   │   └── alone.prompt
+│   ├── test2_inheritance/
+│   │   ├── _global.txt
+│   │   ├── landscape.txt
+│   │   ...
+│   ├── test4_validator/
+│   │   ├── multiple_cmds.txt
+│   │   ├── multiple_cmds.alt.txt
+│   │   ...
+│   └── errors/
+│       ├── test3_multi_parents.stderr
+│       ├── test5_parse_error_missing_colon.stderr
+│       └── test6_parse_error_trailing_comma.stderr
+└── test_output/
+    └── ...
+```
 
 ---
 
-## 🚀 **Final Thoughts**
-These features significantly improve **LLMake’s usability** by allowing more flexible LLM execution, **automated validation**, and **clearer debugging messages**. Try running the **updated prompts and commands** and enjoy an improved AI-powered workflow!
+## **3. Usage**
+
+### **3.1. Generating a Makefile Manually**
+
+```bash
+python3 llmake.py --makefile -o Makefile test_llmakes/test1_simple.llmake
+make all
+```
+
+### **3.2. Inheritance Example**
+
+```bash
+python3 llmake.py --makefile -o Makefile test_llmakes/test2_inheritance.llmake
+make all
+```
 
 ---
+
+## **4. Tests**
+
+### **4.1. Running All Tests**
+
+```bash
+python3 test_llmake_system.py
+```
+
+
+### **4.2. Adding a New Test**
+
+1. Place the `.llmake` file in `test_llmakes/<new_case>.llmake`.  
+2. Generate **reference outputs** in `check/<new_case>/`.  
+3. Store reference **stderr** in `check/errors/<new_case>.stderr` if needed.  
+4. Add an entry in `test_all_llmakes` array:
+   ```python
+   test_cases = [
+     ...
+     {'name': 'test7_new_case', 'should_succeed': True},
+   ]
+   ```
+
+---
+
+## **5. Common Pitfalls**
+
+1. **`.DS_Store` on macOS**: We ignore hidden files in the reference directories.  
+2. **Missing Non-Hidden Entry**: If you only define `_global:` (hidden), the `Makefile` has no top-level target → `make all` fails.  
+3. **Multiple Parents**: If a child has two or more parents that define commands, your code raises an error.  
+4. **Validation vs. Retry**: If your validator does not produce a non-zero exit code on failure, auto-retry will not trigger. We do `|| exit 1`.
+
+---
+
+## **6. License**
+
+This project is licensed under the **Apache 2.0 License**.
+
+---
+
+## **7. Final Thoughts**
+
+**LLMake** helps create structured prompt “chains” with dependencies, inheritance, and robust error checking. The included test suite ensures **determinism** across macOS and other platforms by using **simple shell commands** instead of real LLM calls (for example, `echo` and `grep`).  
 

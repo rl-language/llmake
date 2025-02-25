@@ -1,5 +1,5 @@
 ###
-# Copyright 2024 Massimo Fioravanti
+# Copyright 2024 Massimo Fioravanti, Attilio Polito, Raffaele Russo
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,6 +18,7 @@ import tokenize
 import argparse
 from io import BytesIO
 import os
+import sys
 import filecmp
 from sys import stderr, stdout
 from tempfile import NamedTemporaryFile
@@ -39,28 +40,47 @@ TOKEN_NAMES = {
 
 # ParseError Exception
 class ParseError(Exception):
-    def __init__(self, message, token=None):
-        """
-        Custom exception for parsing errors, including token information.
-
-        Args:
-            message (str): The error message.
-            token (tokenize.TokenInfo, optional): The token that caused the error.
-        """
+    def __init__(self, message, token=None, source_lines=None):
+        # Custom exception for parsing errors, including token information and source lines.
         self.message = message
         self.token = token
+        self.source_lines = source_lines
         super().__init__(message)
 
     def __str__(self):
         """
-        Formats the error message to include line/column details and the incorrect token.
+        Formats the error message to include line/column details,
+        shows the exact line from the source, and marks the error column with ^.
         """
-        if self.token and hasattr(self.token, 'start'):
-            line, col = self.token.start
-            token_value = self.token.string
+        base_msg = f"ParseError: {self.message}"
+
+        if self.token and hasattr(self.token, 'start') and self.source_lines:
+            line_num, col_num = self.token.start  # 1-based line, 0-based col
             token_type = tokenize.tok_name.get(self.token.type, "UNKNOWN")
-            return f"ParseError (line {line}, column {col}): {self.message}"
-        return f"ParseError: {self.message}"
+
+            # Ensure line_num is within the source_lines range
+            if 1 <= line_num <= len(self.source_lines):
+                line_content = self.source_lines[line_num - 1]
+            else:
+                line_content = ""
+
+            # Clamp col_num if it's beyond line length
+            if col_num > len(line_content):
+                col_num = len(line_content)
+
+            # Construct a pointer line with ^
+            pointer_line = " " * col_num + "^"
+
+            # Return a more detailed error
+            return (
+                f"ParseError (line {line_num}, column {col_num}): {self.message} "
+                f"– got token {self.token.string!r} (type: {token_type})\n"
+                f"  {line_content}\n"
+                f"  {pointer_line}\n"
+            )
+        else:
+            return base_msg
+
 
 def copy_if_different(src, dst):
     # Check if the destination file exists
@@ -91,7 +111,7 @@ class Entry:
         script = pathlib.Path(__file__)
         dep = " ".join(dependency_to_str(dep) for dep in self.dependencies if not dep.startswith("_"))
         out.write(f"{self.name}.prompt: {prompts_file} {dep}\n")
-        out.write(f"\tpython {script} {prompts_file} {self.name} -o {self.name}.prompt\n\n")
+        out.write(f"\t{sys.executable} {script} {prompts_file} {self.name} -o {self.name}.prompt\n\n")
         out.write(f"{self.name}.txt: {self.name}.prompt\n")
         command_lines = []
 
@@ -140,6 +160,77 @@ class Prompts:
                     stderr.write(f"Error: {entry.source_position} dependency {dep} in prompt {entry.name} does not exist.\n")
                     return False
         return True
+    
+    def inherit_commands(self):
+        """
+        For each prompt that does not define its own commands,
+        inherit commands from exactly one parent.
+        If multiple parents define commands, raise an error.
+        """
+        # 1. Build adjacency for topological sort
+        # 'deps_graph' from parent -> children
+        deps_graph = {}
+        indeg = {}
+        for name in self.entries:
+            deps_graph[name] = []
+            indeg[name] = 0
+
+        # For each child, add edge (parent -> child)
+        for child_name, entry in self.entries.items():
+            for parent_name in entry.dependencies:
+                if "." not in parent_name:  # ignore file-based dependencies
+                    deps_graph[parent_name].append(child_name)
+                    indeg[child_name] += 1
+
+        # 2. Topological sort
+        queue = [n for n in self.entries if indeg[n] == 0]
+        topo_order = []
+        while queue:
+            node = queue.pop()
+            topo_order.append(node)
+            for nxt in deps_graph[node]:
+                indeg[nxt] -= 1
+                if indeg[nxt] == 0:
+                    queue.append(nxt)
+
+        # 3. Inherit commands
+        # We'll store a final "resolved_commands" map from prompt name -> list of commands
+        resolved_commands = {}
+        for name in topo_order:
+            entry = self.entries[name]
+            if entry.llm_commands:
+                # If this prompt already has commands, no inheritance needed
+                resolved_commands[name] = entry.llm_commands
+            else:
+                # If it has no commands, gather from parents
+                parents_with_commands = []
+                for parent_name in entry.dependencies:
+                    if "." in parent_name:
+                        # skip file-based dependencies
+                        continue
+                    # see if parent has resolved commands
+                    p_cmds = resolved_commands.get(parent_name, [])
+                    if p_cmds:
+                        parents_with_commands.append(p_cmds)
+
+                if len(parents_with_commands) > 1:
+                    # multiple parents define commands => error
+                    stderr.write(
+                        f"Error: multiple parents of prompt '{name}' define commands. Ambiguous inheritance.\n"
+                    )
+                    return False
+                elif len(parents_with_commands) == 1:
+                    # exactly one parent with commands, inherit them
+                    resolved_commands[name] = parents_with_commands[0]
+                else:
+                    # no parent has commands
+                    resolved_commands[name] = []
+
+        # 4. Apply resolved commands back to the entries
+        for name in self.entries:
+            self.entries[name].llm_commands = resolved_commands[name]
+        return True
+
 
     def get_prompt(self, name):
         prompts = []
@@ -180,6 +271,10 @@ class Prompts:
 
 class Parser:
     def __init__(self, text):
+
+        # snapshot of the original lines for error display
+        self.source_lines = text.splitlines()  
+        
         self.tokens = [token for token in tokenize.tokenize(BytesIO(text.encode('utf-8')).readline)]
         self.index = 1
         self.current = self.tokens[1]
@@ -203,7 +298,7 @@ class Parser:
     def string(self):
         if self.current.type != tokenize.STRING:
             return None
-        return self.current.string[1:-1]  # strip the quotes
+        return self.current.string[1:-1]
 
     def end(self):
         return self.current.type == tokenize.ENDMARKER
@@ -231,10 +326,11 @@ class Parser:
         to_return = element()
         if not to_return:
             expected_name = element.__name__
-            expected_symbol = TOKEN_NAMES.get(expected_name, expected_name)  # Use dictionary, fallback to function name
+            expected_symbol = TOKEN_NAMES.get(expected_name, expected_name)  # use dictionary
             raise ParseError(
                 f"Expected {expected_symbol} – got token {self.current.string!r} (type: {tokenize.tok_name[self.current.type]})",
-                token=self.current
+                token=self.current,
+                source_lines=self.source_lines
             )
         self.next()
         return to_return
@@ -248,10 +344,11 @@ class Parser:
 
     def parse_entry(self):
         position = self.current.start
-        name = self.expect(self.name)
-        self.expect(self.colons)
-        dependencies = []
+        name = self.expect(self.name)          # e.g. 'landscape'
+        self.expect(self.colons)              # the colon after name
 
+        # Dependencies
+        dependencies = []
         if not self.accept(self.newline):
             while True:
                 dependencies.append(self.parse_depency())
@@ -259,54 +356,101 @@ class Parser:
                     break
             self.expect(self.newline)
 
+        # Expect indent
         self.expect(self.indent)
+
+        # Skip extra blank lines
         while self.current.type in (tokenize.NEWLINE, tokenize.NL):
             self.next()
 
-        if self.current.type == tokenize.STRING:
-            field_text = self.expect(self.string)
-            fields = {'text': field_text}
-        else:
-            fields = {}
-            while self.current.type != tokenize.DEDENT:
-                if self.accept(self.newline):
-                    continue
-                key = self.expect(self.name)
-                self.expect(self.colons)
-                value = self.expect(self.string)
-                if key in fields:
-                    if isinstance(fields[key], list):
-                        fields[key].append(value)
+        # The first line in this syntax MUST be the string for text
+        field_text = self.expect(self.string)
+        fields = {'text': field_text}
+
+        # Parse the rest of the lines: command, validator, etc.
+        while self.current.type != tokenize.DEDENT:
+            if self.accept(self.newline):
+                continue
+
+            key = self.expect(self.name)      # e.g. 'validator', 'command', etc.
+            self.expect(self.colons)
+            line_str = self.expect(self.string)
+
+            # special check if the key == 'validator'
+            if key == 'validator':
+                # By default, we do not have a retry
+                line_retry = 0
+
+                # Check if there's a trailing 'retry' <number>
+                # We'll accept the next token if it is 'retry'
+                if self.accept(self.name) == 'retry':
+                    # Next token must be a number
+                    if self.current.type == tokenize.NUMBER:
+                        line_retry = int(self.current.string)
+                        self.next()
                     else:
-                        fields[key] = [fields[key], value]
+                        raise ParseError("Expected a number after 'retry'", self.current)
+
+                # store the command (line_str) in fields['validator']
+                # store multiple validators in a list
+                # we store each validator as a dict with 'command' & 'retry'
+                if 'validator' not in fields:
+                    fields['validator'] = []
+                fields['validator'].append({'cmd': line_str, 'retry': line_retry})
+
+                # Set auto_retry to the largest
+                if line_retry > 0:
+                    # if the user had a previous auto_retry, pick the max
+                    old_retry = int(fields.get('auto_retry', 0))
+                    fields['auto_retry'] = str(max(old_retry, line_retry))
+
+            else:
+                # Normal key: e.g. "command"
+                # If it's command, we do the usual append
+                if key not in fields:
+                    fields[key] = line_str
                 else:
-                    fields[key] = value
+                    # if key is repeated, store as list
+                    if isinstance(fields[key], list):
+                        fields[key].append(line_str)
+                    else:
+                        fields[key] = [fields[key], line_str]
 
-                while self.accept(self.newline):
-                    pass
+            # skip extra newlines
+            while self.accept(self.newline):
+                pass
 
+        # Expect deindent
         self.expect(self.deindent)
 
+        # Build final data
+        # Check if there's 'text'
         if 'text' not in fields:
             raise ParseError("Missing 'text' field in entry.", self.current)
+
+        # Convert 'command' fields to a list
+        llm_commands = []
         if 'command' in fields:
             if isinstance(fields['command'], list):
                 llm_commands = fields['command']
             else:
                 llm_commands = [fields['command']]
-        else:
-            llm_commands = []
 
+        # Convert 'validator' fields into a dictionary 
+        validator_commands = []
         if 'validator' in fields:
-            if isinstance(fields['validator'], list):
-                validator_commands = fields['validator']
-            else:
-                validator_commands = [fields['validator']]
-        else:
-            validator_commands = []
+            # we stored each validator as {'cmd': ..., 'retry': ...}
+            # we want the command strings for each validator
+            # the retry is handled in auto_retry
+            v_list = fields['validator']
+            if not isinstance(v_list, list):
+                v_list = [v_list]
+            for v_obj in v_list:
+                validator_commands.append(v_obj['cmd'])
 
+        # If user typed a raw number in auto_retry, parse it
         auto_retry = int(fields['auto_retry']) if 'auto_retry' in fields else 0
-        
+
         return Entry(
             name,
             dependencies,
@@ -359,6 +503,9 @@ def main():
         exit(1)
     if not prompts.validate_dependencies():
         exit(1)
+    if not prompts.inherit_commands():
+        exit(1)
+
     if args.makefile:
         prompts.to_make(output, args.file)
         output.flush()
@@ -385,74 +532,59 @@ if __name__ == "__main__":
 
 
 '''
-Good prompt:
+-----------------Good prompt-----------------
 
 _global:
-    text: "This is a shared context that will apply to multiple prompts."
+    "This is a shared context that will apply to multiple prompts."
+    command: "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt"
 
 landscape: _global
-    text: "Describe a natural landscape with mountains and rivers."
-    command: "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt"
-    validator: "grep -q 'mountains' {name}.txt || (echo 'Validation failed: No mountains mentioned.' >&2; exit 1)'"
-    auto_retry: "2"
+    "Describe a natural landscape with mountains and rivers."
+    validator: "grep -q 'mountains' {name}.txt" retry 2
 
+village: landscape
+    "Describe a small village inside the previously described landscape."
+    validator: "grep -q 'village' {name}.txt" retry 3
 
-village: _global, landscape
-    text: "Describe a small village inside the previously described landscape."
+people: village
+    "Describe the people living in the previously described village."
     command: "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt"
-    validator: "grep -q 'village' {name}.txt || (echo 'Validation failed: No village mentioned.' >&2; exit 1)'"
-    auto_retry: "3"
-
-people: _global, village
-    text: "Describe the people living in the previously described village."
-    command: "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt"
-    validator: "grep -q 'people' {name}.txt || (echo 'Validation failed: No people mentioned.' >&2; exit 1)'"
-    auto_retry: "2"
+    validator: "grep -q 'people' {name}.txt" retry 2
 
     
-What Happens?
-_global is a hidden dependency that contains shared context.
-landscape depends on _global and describes mountains/rivers.
-village depends on _global and landscape, ensuring continuity.
-people depends on _global and village, linking all descriptions.
-Each prompt includes a validator that checks for expected keywords.
-If validation fails, the system automatically retries up to the specified attempts.
 
-Bad prompt:
+-----------------Bad prompt-----------------
 
 city:
-    text: "Describe a futuristic city"
+    "Describe a futuristic city"
     command "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt" 
-    validator: "grep -q 'city' {name}.txt || echo 'Validation failed: No city mentioned.'"
+    validator: "grep -q 'city' {name}.txt"
 
-forest: city,
-    text: "Describe the nearby forest"
+forest: city
     command: "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt"
+    "Describe the nearby forest"
 
-What’s Wrong?
-Missing Colon (:) After command in city
-Correct format: command: "...", but we wrote command "...".
-Trailing Comma in forest Dependencies
-forest: city, should not have a comma at the end if there are no additional dependencies.
-validator: wrote in a wrong manner (in this way the exit code of the command will be zero, the auto_retry will not be triggered)
-
-Expected Output from ParseError:
-
-If we run:
-
-python llmake.py bad_prompt.llmake --makefile
+Missing colons (':') after "command".
+Text "Describe the nearby forest" should be before everithing else
 
 
-The parser will generate the following error:
+  
+-----------------Example hierarchy-----------------
 
-ParseError (line 3, column 12): Expected ':' – got token '"ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt"' (type: STRING)
+_global:
+    "This is a shared context that will apply to multiple prompts."
+    command: "ollama run deepseek-r1:14b < {name}.prompt | tee {name}.txt"
+    command: "ollama run mistral < {name}.prompt | tee {name}.alt.txt"
 
+landscape: _global
+    "Describe a natural landscape with mountains, rivers, and forests."
+    # No 'command:' lines => inherits from _global
 
-Second Error Example (Trailing Comma in forest)
-If we fix the first error but leave the trailing comma in forest, the parser will detect it and generate:
+desert: _global
+    "Describe a harsh desert environment."
+    # Also no commands => inherits from _global
 
-ParseError (line 6, column 13): Expected a NAME (e.g., variable or keyword) – got token '\n' (type: NEWLINE)
-
-
-
+forest: landscape
+    "Describe a lush forest that transitions from the mountains."
+    # Inherits from 'landscape' => which inherits from '_global'
 '''
