@@ -1,5 +1,5 @@
 ###
-# Copyright 2024 Massimo Fioravanti, Attilio Polito, Raffaele Russo
+# Copyright 2024 Massimo Fioravanti
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -161,14 +161,13 @@ class Prompts:
                     return False
         return True
     
-    def inherit_commands(self):
+    def inherit_properties(self):
         """
-        For each prompt that does not define its own commands,
-        inherit commands from exactly one parent.
-        If multiple parents define commands, raise an error.
+        Inherit commands, validators, and auto_retry from a single parent if
+        the child doesn't define them. For auto_retry, if multiple parents define it,
+        we take the maximum value instead of raising an error.
         """
         # 1. Build adjacency for topological sort
-        # 'deps_graph' from parent -> children
         deps_graph = {}
         indeg = {}
         for name in self.entries:
@@ -182,7 +181,7 @@ class Prompts:
                     deps_graph[parent_name].append(child_name)
                     indeg[child_name] += 1
 
-        # 2. Topological sort
+        # 2) Topological sort
         queue = [n for n in self.entries if indeg[n] == 0]
         topo_order = []
         while queue:
@@ -193,42 +192,82 @@ class Prompts:
                 if indeg[nxt] == 0:
                     queue.append(nxt)
 
-        # 3. Inherit commands
-        # We'll store a final "resolved_commands" map from prompt name -> list of commands
-        resolved_commands = {}
+        # Prepare to store final resolved properties
+        resolved_cmds = {}
+        resolved_validators = {}
+        resolved_retry = {}
+
+        # 3. Inherit logic
         for name in topo_order:
             entry = self.entries[name]
+
+            # ---------- Commands ----------
             if entry.llm_commands:
-                # If this prompt already has commands, no inheritance needed
-                resolved_commands[name] = entry.llm_commands
+                resolved_cmds[name] = entry.llm_commands
             else:
-                # If it has no commands, gather from parents
-                parents_with_commands = []
+                # gather from parents
+                parents_with_cmds = []
                 for parent_name in entry.dependencies:
                     if "." in parent_name:
-                        # skip file-based dependencies
                         continue
-                    # see if parent has resolved commands
-                    p_cmds = resolved_commands.get(parent_name, [])
+                    p_cmds = resolved_cmds.get(parent_name, [])
                     if p_cmds:
-                        parents_with_commands.append(p_cmds)
+                        parents_with_cmds.append(p_cmds)
 
-                if len(parents_with_commands) > 1:
-                    # multiple parents define commands => error
-                    stderr.write(
-                        f"Error: multiple parents of prompt '{name}' define commands. Ambiguous inheritance.\n"
-                    )
+                if len(parents_with_cmds) > 1:
+                    stderr.write(f"Error: multiple parents of '{name}' define commands. Ambiguous.\n")
                     return False
-                elif len(parents_with_commands) == 1:
-                    # exactly one parent with commands, inherit them
-                    resolved_commands[name] = parents_with_commands[0]
+                elif len(parents_with_cmds) == 1:
+                    resolved_cmds[name] = parents_with_cmds[0]
                 else:
-                    # no parent has commands
-                    resolved_commands[name] = []
+                    resolved_cmds[name] = []
 
-        # 4. Apply resolved commands back to the entries
+            # ---------- Validators ----------
+            if entry.validator_commands:
+                resolved_validators[name] = entry.validator_commands
+            else:
+                parents_with_validators = []
+                for parent_name in entry.dependencies:
+                    if "." in parent_name:
+                        continue
+                    p_valids = resolved_validators.get(parent_name, [])
+                    if p_valids:
+                        parents_with_validators.append(p_valids)
+
+                if len(parents_with_validators) > 1:
+                    stderr.write(f"Error: multiple parents of '{name}' define validators. Ambiguous.\n")
+                    return False
+                elif len(parents_with_validators) == 1:
+                    resolved_validators[name] = parents_with_validators[0]
+                else:
+                    resolved_validators[name] = []
+
+            # ---------- Auto-Retry (TAKE MAX) ----------
+            if entry.auto_retry > 0:
+                # Child defines a retry
+                resolved_retry[name] = entry.auto_retry
+            else:
+                # Collect all non-zero parent retries
+                parent_retries = []
+                for parent_name in entry.dependencies:
+                    if "." in parent_name:
+                        continue
+                    p_retry = resolved_retry.get(parent_name, 0)
+                    if p_retry > 0:
+                        parent_retries.append(p_retry)
+
+                if parent_retries:
+                    # TAKE THE MAX if multiple parents define different retry
+                    resolved_retry[name] = max(parent_retries)
+                else:
+                    resolved_retry[name] = 0
+
+        # 4) Write the resolved properties back into each entry
         for name in self.entries:
-            self.entries[name].llm_commands = resolved_commands[name]
+            self.entries[name].llm_commands = resolved_cmds[name]
+            self.entries[name].validator_commands = resolved_validators[name]
+            self.entries[name].auto_retry = resolved_retry[name]
+
         return True
 
 
@@ -503,7 +542,7 @@ def main():
         exit(1)
     if not prompts.validate_dependencies():
         exit(1)
-    if not prompts.inherit_commands():
+    if not prompts.inherit_properties():
         exit(1)
 
     if args.makefile:

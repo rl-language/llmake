@@ -1,4 +1,0 @@
-ParseError (line 3, column 12): Expected ':' – got token '"echo \'City\' > {name}.txt"' (type: STRING) – got token '"echo \'City\' > {name}.txt"' (type: STRING)
-      command "echo 'City' > {name}.txt"
-              ^
-

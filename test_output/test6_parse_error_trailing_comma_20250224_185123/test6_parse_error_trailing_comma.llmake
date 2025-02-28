@@ -1,3 +1,0 @@
-forest: city,
-    "Describe a nearby forest"
-    command: "echo 'Forest' > {name}.txt"

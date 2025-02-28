@@ -1,4 +1,0 @@
-alone:
-    "This is a single prompt with no dependencies."
-    command: "echo 'Hello from alone' > {name}.txt"
-    validator: "grep -q 'Hello' {name}.txt || (echo 'Validator failed' >&2; exit 1)" retry 1

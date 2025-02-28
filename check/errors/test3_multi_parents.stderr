@@ -1,1 +1,1 @@
-Error: multiple parents of prompt 'child' define commands. Ambiguous inheritance.
+Error: multiple parents of 'child' define commands. Ambiguous.

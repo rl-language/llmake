@@ -1,5 +1,0 @@
-multiple_cmds:
-    "Test multiple commands and inline validator retry"
-    command: "echo 'Hello main file' > {name}.txt"
-    command: "echo 'Hello alt file' > {name}.alt.txt"
-    validator: "grep -q 'Hello main file' {name}.txt || (echo 'Validator failed' >&2; exit 1)" retry 2
