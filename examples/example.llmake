@@ -1,8 +1,0 @@
-_global:
-    "describe the following thing"
-
-house: _global
-    "a small house"
-
-another_house: _global, house
-    "a house next to the other one"

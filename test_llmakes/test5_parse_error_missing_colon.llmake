@@ -1,0 +1,4 @@
+city:
+    "Describe a futuristic city"
+    command "echo 'City' > {name}.txt"
+    validator: "grep -q 'City' {name}.txt 
